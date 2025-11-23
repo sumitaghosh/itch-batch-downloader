@@ -127,20 +127,116 @@ def slugify(value, allow_unicode=False, is_value_a_filename=False):
     
     return value
 
-def fetch_upload(uploads_soup, dlurl, session, params, csfrtoken, gamedirectory, fileNr):
-    # returns true if the file was downloaded
+def fetch_upload(uploads_soup, dlurl, session, params, csfrtoken, gamedirectory, fileNr, full_page_soup=None):
+    """
+    Download a single upload from a product page.
+    Returns True if the file was successfully written, False otherwise.
+    """
+    # Find the upload identifier – try the old attribute first, then fall back to the newer href‑based format.
     try:
+        # Old style (still present on some older pages)
         downloadid = uploads_soup.find("a")["data-upload_id"]
-    except:
-        print(datetime.now().strftime("%Y-%m-%d %H:%M:%S") + " " + f"{Fore.YELLOW}[WARNING]{Style.RESET_ALL} Skipped a file: {dlurl}")
-        print(datetime.now().strftime("%Y-%m-%d %H:%M:%S") + " " + f"{Fore.YELLOW}[WARNING]{Style.RESET_ALL} =====================================")
-        traceback.print_exc()
-        print(datetime.now().strftime("%Y-%m-%d %H:%M:%S") + " " + f"{Fore.YELLOW}[WARNING]{Style.RESET_ALL} =====================================")
-        return False
-    dlurl_final = dlurl + "/file/" + downloadid
-    dlj = session.post(dlurl_final, params=params, data=csfrtoken).json()
+        # old style – we will later POST to dlurl/file/<downloadid>
+        use_direct_endpoint = False
+    except (TypeError, KeyError):
+        # ------------------------------------------------------------------
+        # 2️⃣  New style – look for a link that contains "/download/"
+        # ------------------------------------------------------------------
+        dl_link = None
 
-    if dlj["url"].split("/")[2] == "w3g3a5v6.ssl.hwcdn.net":
+        # The upload block may contain several <a>/<button> elements.
+        # We search for any that has an href with the substring "/download/".
+        for candidate in uploads_soup.find_all(["a", "button"]):
+            href = candidate.get("href", "")
+            if "/download/" in href:
+                dl_link = href
+                break
+        
+        # 3️⃣  If the upload block did NOT contain a download link,
+        #     fall back to the **whole page** (the purchase banner).
+        if not dl_link and full_page_soup is not None:
+            banner_btn = full_page_soup.find(
+                "a",
+                class_="button",
+                href=lambda h: h and "/download/" in h,
+            )
+            if banner_btn:
+                dl_link = banner_btn["href"]
+
+        # 4️⃣  If we still have nothing, give up with a clear warning.
+        if not dl_link:
+            # No recognizable download button – give up with a clear warning.
+            print(
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                + " "
+                + f"{Fore.YELLOW}[WARNING]{Style.RESET_ALL} Skipped a file (no download button found): {dlurl}"
+            )
+            return False
+
+        # The link we found already points to the *download endpoint*.
+        # It returns the same JSON that the old POST request would have.
+        # We therefore treat it as the final URL and skip the POST step.
+        dlurl = dl_link
+        use_direct_endpoint = True
+
+    # ------------------------------------------------------------------
+    # 3️⃣  Build the request that yields the JSON with the real file URL.
+    # ------------------------------------------------------------------
+    if use_direct_endpoint:
+        # The endpoint returns JSON directly – just GET it.
+        dlj = session.get(dlurl, params=params, cookies=session.cookies).json()
+    else:
+        # Legacy path – POST to the /file/<downloadid> endpoint.
+        dlurl_final = f"{dlurl}/file/{downloadid}"
+        dlj = session.post(dlurl_final, params=params, data=csfrtoken).json()
+
+    domain = dlj["url"].split("/")[2]
+    # --------------------------------------------
+    # 1️⃣  Cloudflare‑mirrored URLs (the ones that caused the KeyError)
+    # -------------------------------------------------------------
+    if "cloudflarestorage.com" in domain or domain.startswith("itchio-mirror"):
+        # These URLs often **do not** provide a `Last‑Modified` header, so we
+        # cannot use the old HEAD‑based logic that expects it.  Instead we
+        # hand the URL straight to `dltool.download_a_file()`, which already
+        # knows how to skip the HEAD request, stream the file, and infer a
+        # filename from the response headers (or from the URL if the header
+        # is missing).
+
+        # ----------------------------------------------------------------
+        # Build the directory where the file will be stored (same as the
+        # original script does for CDN files).
+        # ----------------------------------------------------------------
+        fulldldir = os.path.join(
+            config["DEFAULT"]["download_directory"], gamedirectory
+        )
+        os.makedirs(fulldldir, exist_ok=True)
+
+        # --------------------------------------------------------------
+        # IMPORTANT: **DO NOT** supply a concrete filename here.
+        # Passing an empty string tells `dltool.download_a_file()` to use the
+        # `Content‑Disposition` header that the server returns, which contains
+        # the proper human‑readable name (e.g. “Phobetor's Children -
+        # Matt Mason.epub”).
+        # --------------------------------------------------------------
+        placeholder_name = ""                     # let dltool decide
+        target_path = os.path.join(fulldldir, placeholder_name)
+
+        # ----------------------------------------------------------------
+        # Call the downloader.  `debugon` mirrors the original behaviour.
+        # ----------------------------------------------------------------
+        debugon = config["DEFAULT"]["debug_logs"] == "ON"
+        was_the_file_downloaded = dltool.download_a_file(
+            dlj["url"],               # the Cloudflare‑mirrored URL
+            filename=target_path,     # empty filename → use server‑provided name
+            session=session,
+            debugon=debugon,
+        )
+        return was_the_file_downloaded
+
+    # -----------------------------------------------------------------
+    # 2️⃣  Original CDN (w3g3a5v6.ssl.hwcdn.net) – keep the old block
+    # ------------------------------------------------------------------
+    elif domain == "w3g3a5v6.ssl.hwcdn.net":
         # remote file check
         x = 0
         while x < 3:
@@ -223,15 +319,22 @@ def fetch_upload(uploads_soup, dlurl, session, params, csfrtoken, gamedirectory,
                     sys.exit(1)
 
         return wasTheFileDownloaded
-                
+
     else:
-        dldomain = dlj["url"].split("/")[2]
-        tempUrl = dlj["url"]
-        if dldomain == "drive.google.com":
-            print(datetime.now().strftime("%Y-%m-%d %H:%M:%S") + " " + f"{Fore.YELLOW}[WARNING]{Style.RESET_ALL} Download from Google Drive is UNSUPPORTED: {tempUrl}")
-        else:
-            print(datetime.now().strftime("%Y-%m-%d %H:%M:%S") + " " + f"{Fore.YELLOW}[WARNING]{Style.RESET_ALL} Skipped a file: {tempUrl}")
-        return False
+            # External host (Google Drive, Dropbox, etc.) – keep the original warning.
+            if domain == "drive.google.com":
+                print(
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    + " "
+                    + f"{Fore.YELLOW}[WARNING]{Style.RESET_ALL} Download from Google Drive is UNSUPPORTED: {dlj['url']}"
+                )
+            else:
+                print(
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    + " "
+                    + f"{Fore.YELLOW}[WARNING]{Style.RESET_ALL} Skipped a file: {dlj['url']}"
+                )
+            return False
 
 def main(config):
     print(datetime.now().strftime("%Y-%m-%d %H:%M:%S") + " " + "[INFO] Download directory is '{}'".format(config["DEFAULT"]["download_directory"]))
@@ -343,7 +446,7 @@ def main(config):
                     for u in uploads:
                         if config["DEFAULT"]["debug_logs"] == "ON": 
                             print(datetime.now().strftime("%Y-%m-%d %H:%M:%S") + " " + "[DEBUG] fetch_upload - " + "u: " + str(u) + ". durl: " + str(dlurl) + ". session: " + str(session) + ". paramPost: " + str(paramPost) + ". csfrToken: " + str(csfrToken) + ". gamedirectory: " + str(gamedirectory) + ". fileNr: " + str(fileNr))
-                        newDownloadsTemp = fetch_upload(u, dlurl, session, paramPost, csfrToken, gamedirectory, fileNr)
+                        newDownloadsTemp = fetch_upload(u, dlurl, session, paramPost, csfrToken, gamedirectory, fileNr, full_page_soup=dlpage_soup)
                         fileNr = fileNr + 1
                         if not newDownloads:
                             newDownloads = newDownloadsTemp
@@ -428,7 +531,7 @@ def main(config):
                             print(datetime.now().strftime("%Y-%m-%d %H:%M:%S") + " " + f"{Fore.RED}[ERROR]{Style.RESET_ALL} =====================================")
                             
                         # product webpage screenshot is exported to pdf
-                        fullpdfname = os.path.join(download_dir, gamedirectory + "_webpage_screenshot_" + dateyearmonthday + ".pdf")                         
+                        fullpdfname = os.path.join(download_dir, f"{gamedirectory}_webpage_screenshot_{dateyearmonthday}.pdf")                         
                         
                         try:
                             
@@ -438,35 +541,34 @@ def main(config):
                             if newDownloads or pdfsFound <= 0:
                               
                                 if config["DEFAULT"]["create_pdf"] == "ON": 
-                                    calculated_print_options = {
-                                    'landscape': True,
-                                    'displayHeaderFooter': True,
-                                    'printBackground': True,
-                                    'preferCSSPageSize': False,
-                                    'shrinkToFit': True,
-                                    'paper_width': '46.81', 'paper_height': '33.11',
-                                    }
-                                    resource = "/session/%s/chromium/send_command_and_get_result" % driver.session_id
-                                    urlpdf = driver.command_executor._url + resource
-                                    cmd = "Page.printToPDF"
-                                    body = json.dumps({'cmd': cmd, 'params': calculated_print_options})
-                                    response = driver.command_executor._request('POST', urlpdf, body)
-
-                                    if not response:
-                                        try:
-                                            raise Exception(response.get('value'))
-                                        except Exception as error:
-                                            print(datetime.now().strftime("%Y-%m-%d %H:%M:%S") + " " + "[ERROR] " + "PDF generation get response: ")
-                                            print(datetime.now().strftime("%Y-%m-%d %H:%M:%S") + " " + f"{Fore.RED}[ERROR]{Style.RESET_ALL} =====================================")
-                                            traceback.print_exc()
-                                            print(datetime.now().strftime("%Y-%m-%d %H:%M:%S") + " " + f"{Fore.RED}[ERROR]{Style.RESET_ALL} =====================================")
-                                            
-                                    else:
-                                        result = response.get('value')
-                                        with open(fullpdfname, 'wb') as file:
-                                            file.write(base64.b64decode(result['data']))
-
-                                        print(datetime.now().strftime("%Y-%m-%d %H:%M:%S") + " " + "[INFO] PDF created: " + fullpdfname)
+                                    # Selenium 4 provides a high‑level helper that talks to Chrome DevTools Protocol.
+                                    # It returns a dict with a base‑64‑encoded PDF.
+                                    try:
+                                        pdf_bytes = driver.print_page(
+                                            {
+                                                "landscape": True,
+                                                "displayHeaderFooter": True,
+                                                "printBackground": True,
+                                                "preferCSSPageSize": False,
+                                                "shrinkToFit": True,
+                                                "paperWidth": 46.81,   # inches – same values the old code used
+                                                "paperHeight": 33.11,
+                                            }
+                                        )
+                                        # `pdf_bytes` is already a binary blob (bytes) – write it straight to disk.
+                                        with open(fullpdfname, "wb") as f:
+                                            f.write(pdf_bytes)
+                                        print(
+                                            datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                                            + " [INFO] PDF created: "
+                                            + fullpdfname
+                                        )
+                                    except Exception as e:
+                                        print(
+                                            datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                                            + " " + f"{Fore.RED}[ERROR]{Style.RESET_ALL} PDF generation failed: {e}"
+                                        )
+                                        traceback.print_exc()
                                 else:
                                     print(datetime.now().strftime("%Y-%m-%d %H:%M:%S") + " " + "[INFO] PDF creation disabled as config setting not equal to ON")
                             else:
@@ -503,9 +605,20 @@ def main(config):
                             bsParser = BeautifulSoup(pageHtml, features='html.parser')
                             hrefs = bsParser.find_all('iframe')
                             for href in hrefs:
-                                print(datetime.now().strftime("%Y-%m-%d %H:%M:%S") + " " + "[INFO] Found URL: {}".format(href.get("src")))
+                                raw_src = href.get("src")                # e.g. "https://itch.io/embed/3347678?... "
+                                # Normalise the URL:
+                                if raw_src.startswith("//"):                 # protocol‑relative URLs (//domain/…)
+                                    video_url = "https:" + raw_src
+                                elif raw_src.startswith("http://") or raw_src.startswith("https://"):
+                                    video_url = raw_src                      # already a full URL – keep it as‑is
+                                else:                                        # fallback – assume HTTPS
+                                    video_url = "https://" + raw_src.lstrip("/")
+
+                                print(datetime.now().strftime("%Y-%m-%d %H:%M:%S") + " " +
+                                      f"[INFO] Found video URL: {video_url}")
+
                                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                                    error_code = ydl.download("https:" + href.get("src"))
+                                    error_code = ydl.download(video_url)
                                     
                         else:
                         
