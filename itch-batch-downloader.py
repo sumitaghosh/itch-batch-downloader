@@ -193,14 +193,11 @@ def fetch_upload(uploads_soup, dlurl, session, params, csfrtoken, gamedirectory,
         )
         os.makedirs(fulldldir, exist_ok=True)
 
-        placeholder_name = "" # let dltool name it
-        target_path = os.path.join(fulldldir, placeholder_name)
-
         # Call the downloader.  `debugon` mirrors the original behaviour.
         debugon = config["DEFAULT"]["debug_logs"] == "ON"
         was_the_file_downloaded = dltool.download_a_file(
             dlj["url"],               # the Cloudflare‑mirrored URL
-            filename=target_path,     # empty filename → use server‑provided name
+            filename=fulldldir,     # empty filename → use server‑provided name
             session=session,
             debugon=debugon,
         )
